@@ -1,8 +1,5 @@
-// Copyright 2015 Daniel Theophanes.
-// Use of this source code is governed by a zlib-style
-// license that can be found in the LICENSE file.
+/* This is a service for replacing the dispatcher service on common02 server of QMM3*/
 
-// Simple service that only works by printing a log message every few seconds.
 package main
 
 import (
@@ -25,6 +22,27 @@ type thread struct {
 
 type config struct {
 	Threads []thread `json:"threads"`
+}
+
+func recursiveAdd(path string, watcher *fsnotify.Watcher) error {
+	if err := filepath.Walk(path, func(path string, fi os.FileInfo, err error) error {
+		if fi.Mode().IsDir() {
+			return watcher.Add(path)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkIsDir(path string) (bool, error) {
+	fInfo, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+
+	return fInfo.IsDir(), nil
 }
 
 func checkExistence(path string) (bool, error) {
@@ -52,6 +70,27 @@ func loadConfig(path string) (*config, error) {
 	err = jde.Decode(cf)
 	if err != nil {
 		return nil, err
+	}
+
+	for i := 0; i < len(cf.Threads); i++ {
+		cf.Threads[i].Source = filepath.ToSlash(cf.Threads[i].Source)
+		cf.Threads[i].Destination = filepath.ToSlash(cf.Threads[i].Destination)
+
+		isDir, err := checkIsDir(cf.Threads[i].Source)
+		if err != nil {
+			return nil, err
+		}
+		if !isDir {
+			return nil, errors.New("Specified path:" + cf.Threads[i].Source + " is not a dir.")
+		}
+
+		isDir, err = checkIsDir(cf.Threads[i].Destination)
+		if err != nil {
+			return nil, err
+		}
+		if !isDir {
+			return nil, errors.New("Specified path:" + cf.Threads[i].Destination + " is not a dir.")
+		}
 	}
 
 	return cf, nil
@@ -106,7 +145,7 @@ func copyFile(from string, to string) error {
 func matchThread(path string, confThreads []thread) int {
 
 	for idx, th := range confThreads {
-		if match, _ := filepath.Match(filepath.ToSlash(th.Source)+"/*", filepath.ToSlash(path)); match {
+		if match, _ := filepath.Match(th.Source+"/*", path); match {
 			return idx
 		}
 	}
@@ -115,6 +154,7 @@ func matchThread(path string, confThreads []thread) int {
 }
 
 var logger service.Logger
+var modeFlags = []string{"run", "install", "uninstall", ""}
 
 type program struct {
 	conf *config
@@ -143,7 +183,7 @@ func (p *program) run() error {
 	defer watcher.Close()
 
 	for _, th := range p.conf.Threads {
-		err := watcher.Add(th.Source)
+		err := recursiveAdd(th.Source, watcher)
 		if err != nil {
 			logger.Errorf("Error on adding new file path %s", th.Source)
 			return err
@@ -158,21 +198,38 @@ func (p *program) run() error {
 				return nil
 			}
 			if event.Has(fsnotify.Create) {
-				logger.Infof("New file created: %s", event.Name)
-				idx := matchThread(event.Name, p.conf.Threads)
-				if idx < 0 {
-					logger.Errorf("New file %s fails to match any source paths specified.", event.Name)
-					continue
-				}
 
-				time.Sleep(500 * time.Millisecond)
+				event.Name = filepath.ToSlash(event.Name)
 
-				err = copyFile(event.Name, p.conf.Threads[idx].Destination)
+				isDir, err := checkIsDir(event.Name)
 				if err != nil {
-					logger.Errorf("Failed to copy file from %s to %s.", event.Name, p.conf.Threads[idx].Destination)
+					logger.Errorf("Error on checking whether it is a dir of %s", event.Name)
 					continue
 				}
-				logger.Infof("Success to copy file from %s to %s.", event.Name, p.conf.Threads[idx].Destination)
+				if isDir {
+					logger.Infof("New folder created: %s, and it would be added to watcher.", event.Name)
+					err := watcher.Add(event.Name)
+					if err != nil {
+						logger.Errorf("Failed to add newly created folder %s into watcher.", event.Name)
+						continue
+					}
+				} else {
+					logger.Infof("New file created: %s", event.Name)
+					idx := matchThread(event.Name, p.conf.Threads)
+					if idx < 0 {
+						logger.Errorf("New file %s fails to match any source paths specified.", event.Name)
+						continue
+					}
+
+					time.Sleep(500 * time.Millisecond)
+
+					err = copyFile(event.Name, p.conf.Threads[idx].Destination)
+					if err != nil {
+						logger.Errorf("Failed to copy file from %s to %s.", event.Name, p.conf.Threads[idx].Destination)
+						continue
+					}
+					logger.Infof("Success to copy file from %s to %s.", event.Name, p.conf.Threads[idx].Destination)
+				}
 			}
 
 		case err, ok := <-watcher.Errors:
@@ -195,11 +252,30 @@ func (p *program) Stop(s service.Service) error {
 }
 
 func main() {
-	svcFlag := flag.String("config", "", "Specify the config file.")
+
+	svcFlag := flag.String("c", "", "Specify the config json."+
+		" It will use ./Dispatcher.json if not specified.")
+	modeFlag := flag.String("m", "", "Specify the mode: install, uninstall, run.")
 	flag.Parse()
 
-	if len(*svcFlag) <= 0 {
-		log.Fatal("No config file specified.")
+	if *svcFlag == "" {
+		execPath, err := os.Executable()
+		if err != nil {
+			log.Fatal("Cannot find the default config file.")
+			return
+		}
+		*svcFlag = filepath.Join(filepath.Dir(execPath), "Dispatcher.json")
+	}
+
+	notFound := true
+	for _, fl := range modeFlags {
+		if *modeFlag == fl {
+			notFound = false
+		}
+	}
+
+	if notFound {
+		log.Fatal("Unrecognized mode flag.")
 		return
 	}
 
@@ -208,22 +284,18 @@ func main() {
 		log.Fatal("Cannot check the existence of config file.")
 	}
 	if !exist {
-		log.Fatalf("Config file %s does not exist.", svcFlag)
+		log.Fatalf("Config file %s does not exist.", *svcFlag)
 	}
 
 	config, err := loadConfig(*svcFlag)
+	if err != nil {
+		log.Fatalf("Loading config file error : %s", err)
+	}
 
-	options := make(service.KeyValue)
-	options["Restart"] = "on-success"
-	options["SuccessExitStatus"] = "1 2 8 SIGKILL"
 	svcConfig := &service.Config{
 		Name:        "FileDispatcher",
 		DisplayName: "File Dispatcher that copies files.",
 		Description: "To replace the dispatcher service in common02 server for QMM.",
-		Dependencies: []string{
-			"Requires=network.target",
-			"After=network-online.target syslog.target"},
-		Option: options,
 	}
 
 	prg := &program{conf: config}
@@ -237,8 +309,24 @@ func main() {
 		log.Fatal(err)
 	}
 
-	err = s.Run()
-	if err != nil {
-		logger.Error(err)
+	if *modeFlag == "install" {
+		err = s.Install()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	if *modeFlag == "uninstall" {
+		err = s.Uninstall()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	if *modeFlag == "" || *modeFlag == "run" {
+		err = s.Run()
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 }
